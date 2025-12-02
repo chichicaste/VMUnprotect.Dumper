@@ -1,4 +1,4 @@
-﻿using System.Reflection;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AsmResolver.DotNet;
@@ -23,13 +23,15 @@ Console.WriteLine(asciiArt);
 
 string? target;
 
-if (args.Length > 0 && File.Exists(args[0]))
-    target = Prompt.Input<string>("Enter file path", args[0]);
+if (args.Length > 0)
+    target = args[0];
 else
     target = Prompt.Input<string>("Enter file path");
 
 if (File.Exists(target))
 {
+    target = Path.GetFullPath(target);
+
     var output = $"{Path.GetFileNameWithoutExtension(target)}-decrypted.exe";
 
     // Try to load assembly and gather the ManifestModule
@@ -50,44 +52,61 @@ if (File.Exists(target))
     // Quick load for .cctor search
     var module = ModuleDefinition.FromFile(target);
 
-    // Resolve MethodBase of .cctor where vmp initializes itself
-    var cctor =
-        assembly.ManifestModule.ResolveMethod(module.TopLevelTypes[0].GetStaticConstructor()!.MetadataToken.ToInt32());
-
     // Get Module Base Address from loaded assembly
     var hInstance = Marshal.GetHINSTANCE(manifestModule);
 
-    // Make sure static constructor exists
-    if (cctor is not null)
+    // Resolve MethodBase of .cctor where vmp initializes itself
+    var staticCtor = module.TopLevelTypes[0].GetStaticConstructor();
+    if (staticCtor is not null)
     {
-        // Force VMProtect to fix methods
-        RuntimeHelpers.PrepareMethod(cctor.MethodHandle);
-
-        // Load PEFile from disk
-        var diskImage = PEFile.FromFile(target);
-
-        // Get correct AddressOfEntrypoint and fix determining whether the image is a PE32 (32-bit) or a PE32+ (64-bit) image.
-        var epFromDisk = diskImage.OptionalHeader.AddressOfEntrypoint;
-        var magicDisk = diskImage.OptionalHeader.Magic;
-
-        // Load decrypted PEFile from module base
-        var runtimeImage = PEFile.FromModuleBaseAddress(hInstance, PEMappingMode.Mapped);
-
-        var optionalHeader = runtimeImage.OptionalHeader;
-        optionalHeader.Magic = magicDisk; // Fix the incorrect magic
-        optionalHeader.AddressOfEntrypoint = epFromDisk; // Fix the incorrect AddressOfEntrypoint
-
-        // Write fixed runtimeImage to disk
-        using (var fs = File.Create(output))
+        var cctor = assembly.ManifestModule.ResolveMethod(staticCtor.MetadataToken.ToInt32());
+        if (cctor is not null)
         {
-            runtimeImage.Write(new BinaryStreamWriter(fs));
-        }
+            // Force VMProtect to fix methods
+            try
+            {
+                RuntimeHelpers.PrepareMethod(cctor.MethodHandle);
+            }
+            catch (TypeInitializationException ex)
+            {
+                Console.WriteLine($"Warning: .cctor threw {ex.GetType().Name} - {ex.InnerException?.Message ?? ex.Message}. Continuing without prepared method.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error preparing method: {ex}");
+                return;
+            }
 
-        Console.WriteLine($"Saved as: {Path.GetFullPath(output)}");
+            // Load PEFile from disk
+            var diskImage = PEFile.FromFile(target);
+
+            // Get correct AddressOfEntrypoint and fix determining whether the image is a PE32 (32-bit) or a PE32+ (64-bit) image.
+            var epFromDisk = diskImage.OptionalHeader.AddressOfEntrypoint;
+            var magicDisk = diskImage.OptionalHeader.Magic;
+
+            // Load decrypted PEFile from module base
+            var runtimeImage = PEFile.FromModuleBaseAddress(hInstance, PEMappingMode.Mapped);
+
+            var optionalHeader = runtimeImage.OptionalHeader;
+            optionalHeader.Magic = magicDisk; // Fix the incorrect magic
+            optionalHeader.AddressOfEntrypoint = epFromDisk; // Fix the incorrect AddressOfEntrypoint
+
+            // Write fixed runtimeImage to disk
+            using (var fs = File.Create(output))
+            {
+                runtimeImage.Write(new BinaryStreamWriter(fs));
+            }
+
+            Console.WriteLine($"Saved as: {Path.GetFullPath(output)}");
+        }
+        else
+        {
+            Console.WriteLine("Failed to resolve .cctor");
+        }
     }
     else
     {
-        Console.WriteLine("Failed to prepare .cctor");
+        Console.WriteLine("No static constructor found");
     }
 }
 else
@@ -95,4 +114,5 @@ else
     Console.WriteLine("File either doesn't exist or you didn't provide it (VMProtect.Dumper File.exe)");
 }
 
-Console.ReadKey();
+if (Environment.UserInteractive && !Console.IsInputRedirected)
+    Console.ReadKey();
